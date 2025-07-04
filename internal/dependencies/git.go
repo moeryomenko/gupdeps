@@ -3,12 +3,9 @@ package dependencies
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
-
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"time"
 
 	"github.com/moeryomenko/gupdeps/internal/models"
 	"github.com/moeryomenko/gupdeps/internal/utils"
@@ -42,19 +39,15 @@ func (g *GitOperations) GetCommitsBetweenVersions(dep *models.Dependency) ([]mod
 	repoURL := g.determineRepositoryURL(dep.Name)
 
 	// Clone the repository with minimal depth
-	repo, err := g.cloneRepository(repoURL, tempDir)
-	if err != nil {
+	if err := g.cloneRepository(repoURL, tempDir); err != nil {
 		return nil, err
 	}
 
 	// Try to fetch tags
-	if err := g.fetchTags(repo, dep); err != nil {
-		g.logger.Warn("Failed to fetch tags for %s: %v", dep.Name, err)
-		// Continue execution as we can still try to get commits
-	}
+	g.fetchTags(tempDir, dep)
 
 	// Get commits between versions
-	commits, err := g.getCommitLog(repo, dep)
+	commits, err := g.getCommitLog(tempDir, dep)
 	if err != nil {
 		return nil, err
 	}
@@ -98,192 +91,198 @@ func (g *GitOperations) determineRepositoryURL(modulePath string) string {
 }
 
 // cloneRepository clones the git repository with minimal configuration
-func (g *GitOperations) cloneRepository(repoURL, destDir string) (*git.Repository, error) {
-	// Clone with minimal configuration using go-git
-	repo, err := git.PlainClone(destDir, false, &git.CloneOptions{
-		URL:               repoURL,
-		Depth:             1,
-		SingleBranch:      true,
-		NoCheckout:        false,
-		RecurseSubmodules: git.NoRecurseSubmodules,
-		Progress:          nil,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to clone repository %s: %w", repoURL, err)
-	}
+func (g *GitOperations) cloneRepository(repoURL, destDir string) error {
+	cloneCmd := exec.Command("git", "clone",
+		"--depth=1",
+		"--no-tags",
+		"--filter=blob:none", // Don't fetch file contents initially
+		"--single-branch",    // Only clone a single branch
+		repoURL, destDir)
 
-	return repo, nil
-}
-
-// fetchTags attempts to fetch git tags for the repository
-func (g *GitOperations) fetchTags(repo *git.Repository, dep *models.Dependency) error {
-	// Fetch all tags using go-git
-	err := repo.Fetch(&git.FetchOptions{
-		RefSpecs: []config.RefSpec{"refs/tags/*:refs/tags/*"},
-		Force:    true,
-	})
-
-	// It's okay if we get "already up-to-date" error
-	if err != nil && err != git.NoErrAlreadyUpToDate {
-		g.logger.Warn("Failed to fetch tags for %s: %v", dep.Name, err)
-		return err
+	if err := cloneCmd.Run(); err != nil {
+		return fmt.Errorf("failed to clone repository %s: %w", repoURL, err)
 	}
 
 	return nil
 }
 
+// fetchTags attempts to fetch git tags for the repository
+func (g *GitOperations) fetchTags(repoDir string, dep *models.Dependency) {
+	// First, try to fetch all tags quietly
+	fetchAllCmd := exec.Command("git", "fetch", "--tags", "--quiet", "origin")
+	fetchAllCmd.Dir = repoDir
+
+	if err := fetchAllCmd.Run(); err != nil {
+		// If fetching all tags fails, try specific versions
+		g.fetchSpecificTags(repoDir, dep)
+	}
+}
+
 // fetchSpecificTags attempts to fetch specific version tags
-func (g *GitOperations) resolveVersionRef(repo *git.Repository, versionStr string) (*plumbing.Hash, error) {
-	// Try different version reference formats
+func (g *GitOperations) fetchSpecificTags(repoDir string, dep *models.Dependency) {
 	versionRefs := []string{
-		"refs/tags/" + versionStr,
-		"refs/tags/v" + versionStr,
-		versionStr,
-		"v" + versionStr,
+		"v" + dep.CurrentVersion,
+		dep.CurrentVersion,
+		"v" + dep.LatestVersion,
+		dep.LatestVersion,
 	}
 
+	fetchSpecificCmd := exec.Command("git", "ls-remote", "--tags", "origin")
+	fetchSpecificCmd.Dir = repoDir
+
+	// Get available tags to check against
+	tagsOutput, tagsErr := fetchSpecificCmd.Output()
+	if tagsErr != nil {
+		// If this fails too, try a more aggressive approach
+		fetchCmd := exec.Command("git", "fetch", "--depth=100", "origin")
+		fetchCmd.Dir = repoDir
+		_ = fetchCmd.Run() // Last attempt, ignore errors and try to proceed
+		return
+	}
+
+	// Look for tags that match our versions
+	foundMatches := false
+	tagsStr := string(tagsOutput)
+
+	// Try to identify the right tag format from what's available in the repo
 	for _, ref := range versionRefs {
-		// Try to resolve the reference
-		hash, err := repo.ResolveRevision(plumbing.Revision(ref))
-		if err == nil {
-			return hash, nil
+		if strings.Contains(tagsStr, ref) {
+			// Found a matching tag format, fetch just this one
+			fetchCmd := exec.Command("git", "fetch", "--depth=1", "origin", "tag", ref)
+			fetchCmd.Dir = repoDir
+			_ = fetchCmd.Run() // Ignore errors here, we'll try to proceed anyway
+			foundMatches = true
 		}
 	}
 
-	return nil, fmt.Errorf("could not resolve version reference for %s", versionStr)
+	if !foundMatches {
+		// If no direct matches, try a more aggressive approach
+		fetchCmd := exec.Command("git", "fetch", "--depth=100", "origin")
+		fetchCmd.Dir = repoDir
+		_ = fetchCmd.Run() // Last attempt, ignore errors and try to proceed
+	}
 }
 
 // getCommitLog retrieves and parses the commit log between versions
-func (g *GitOperations) getCommitLog(repo *git.Repository, dep *models.Dependency) ([]models.CommitInfo, error) {
-	// Try to fetch tags to ensure we have the version refs
-	if err := g.fetchTags(repo, dep); err != nil {
-		g.logger.Warn("Failed to fetch tags for %s: %v", dep.Name, err)
-		// Continue execution as we can still try to resolve version references
+func (g *GitOperations) getCommitLog(repoDir string, dep *models.Dependency) ([]models.CommitInfo, error) {
+	versionFormats := []struct {
+		current string
+		latest  string
+	}{
+		{fmt.Sprintf("v%s", dep.CurrentVersion), fmt.Sprintf("v%s", dep.LatestVersion)},
+		{dep.CurrentVersion, dep.LatestVersion},
+		{fmt.Sprintf("refs/tags/v%s", dep.CurrentVersion), fmt.Sprintf("refs/tags/v%s", dep.LatestVersion)},
+		{fmt.Sprintf("refs/tags/%s", dep.CurrentVersion), fmt.Sprintf("refs/tags/%s", dep.LatestVersion)},
+		{fmt.Sprintf("%s^{}", dep.CurrentVersion), fmt.Sprintf("%s^{}", dep.LatestVersion)},
+		{fmt.Sprintf("v%s^{}", dep.CurrentVersion), fmt.Sprintf("v%s^{}", dep.LatestVersion)},
 	}
 
-	// Get the hash for the current and latest versions
-	currentHash, currentErr := g.resolveVersionRef(repo, dep.CurrentVersion)
-	latestHash, latestErr := g.resolveVersionRef(repo, dep.LatestVersion)
-
-	// If we can't resolve the refs, try getting recent commits instead
-	if currentErr != nil || latestErr != nil {
-		g.logger.Warn("Could not resolve version references: current=%v, latest=%v", currentErr, latestErr)
-		return g.getRecentCommits(repo, 300)
+	// Try different version formats for git log
+	for _, format := range versionFormats {
+		output, err := g.runGitLog(repoDir, format.current, format.latest)
+		if err == nil && len(output) > 0 {
+			g.logger.Info("Found commits between %s and %s using format %s..%s",
+				dep.CurrentVersion, dep.LatestVersion, format.current, format.latest)
+			return g.parseCommitLog(output), nil
+		}
 	}
 
-	// Get the commit logs between the two versions
-	commits, err := g.getCommitsBetweenHashes(repo, *currentHash, *latestHash)
+	// Try getting all recent commits as fallback
+	output, err := g.getAllCommits(repoDir)
 	if err != nil {
-		g.logger.Warn("Failed to get commits between versions: %v", err)
-		return g.getRecentCommits(repo, 300)
+		return nil, fmt.Errorf("failed to get commit history: %w", err)
 	}
 
-	if len(commits) == 0 {
+	if len(output) == 0 {
 		g.logger.Info("No commits found between %s %s and %s", dep.Name, dep.CurrentVersion, dep.LatestVersion)
+		return []models.CommitInfo{}, nil
 	}
 
-	return commits, nil
+	return g.parseCommitLog(output), nil
 }
 
 // runGitLog executes git log with the specified version range
-func (g *GitOperations) getCommitsBetweenHashes(
-	repo *git.Repository,
-	from, to plumbing.Hash,
-) ([]models.CommitInfo, error) {
-	// Get commit objects for from and to
-	fromCommit, err := repo.CommitObject(from)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get 'from' commit: %w", err)
-	}
-
-	toCommit, err := repo.CommitObject(to)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get 'to' commit: %w", err)
-	}
-
-	// Use commit log to get commits between versions
-	logOpts := &git.LogOptions{
-		From: toCommit.Hash,
-	}
-
-	commitIter, err := repo.Log(logOpts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get commit log: %w", err)
-	}
-
-	commits := []models.CommitInfo{}
-	maxCommits := 200
-	processedCommits := 0
-
-	err = commitIter.ForEach(func(c *object.Commit) error {
-		// Stop when we reach the "from" commit
-		if c.Hash == fromCommit.Hash {
-			return fmt.Errorf("reached boundary commit")
-		}
-
-		if processedCommits >= maxCommits {
-			return fmt.Errorf("reached maximum commit limit (%d)", maxCommits)
-		}
-
-		processedCommits++
-
-		commits = append(commits, models.CommitInfo{
-			Hash:    c.Hash.String(),
-			Message: c.Message,
-			Date:    c.Author.When,
-		})
-
-		return nil
-	})
-
-	// This error is expected when we reach a boundary condition
-	if err != nil && err.Error() != "reached boundary commit" &&
-		!strings.Contains(err.Error(), "reached maximum commit limit") {
-		return nil, fmt.Errorf("error iterating commits: %w", err)
-	}
-
-	return commits, nil
+func (g *GitOperations) runGitLog(repoDir, fromVersion, toVersion string) ([]byte, error) {
+	cmd := exec.Command("git", "log", "--pretty=format:%H|%s|%aI|%aN|%b",
+		fmt.Sprintf("%s..%s", fromVersion, toVersion))
+	cmd.Dir = repoDir
+	return cmd.Output()
 }
 
 // getAllCommits gets a limited number of recent commits
-func (g *GitOperations) getRecentCommits(repo *git.Repository, limit int) ([]models.CommitInfo, error) {
-	// Get HEAD reference
-	headRef, err := repo.Head()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get HEAD reference: %w", err)
-	}
+func (g *GitOperations) getAllCommits(repoDir string) ([]byte, error) {
+	cmd := exec.Command("git", "log", "--pretty=format:%H|%s|%aI|%aN|%b", "-n", "300")
+	cmd.Dir = repoDir
+	return cmd.Output()
+}
 
-	// Get commit history from HEAD
-	commitIter, err := repo.Log(&git.LogOptions{
-		From: headRef.Hash(),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get commit log: %w", err)
-	}
-
+// parseCommitLog parses the git log output into CommitInfo structs
+func (g *GitOperations) parseCommitLog(output []byte) []models.CommitInfo {
 	commits := []models.CommitInfo{}
+	lines := strings.Split(string(output), "\n")
+	maxCommits := 200
 	processedCommits := 0
 
-	err = commitIter.ForEach(func(c *object.Commit) error {
-		if processedCommits >= limit {
-			return fmt.Errorf("reached maximum commit limit (%d)", limit)
+	for _, line := range lines {
+		if line == "" {
+			continue
 		}
 
+		if processedCommits >= maxCommits {
+			g.logger.Info("Reached maximum commit limit (%d)", maxCommits)
+			break
+		}
 		processedCommits++
 
+		parts := strings.SplitN(line, "|", 5)
+		if len(parts) < 4 { // We need at least hash, message, date, and author
+			continue
+		}
+
+		hash := parts[0]
+		message := parts[1]
+		dateStr := parts[2]
+
+		// Extract full commit message if available
+		fullMessage := message
+		if len(parts) >= 5 && parts[4] != "" {
+			fullMessage = message + "\n\n" + parts[4]
+		}
+
+		date, err := g.parseCommitDate(dateStr)
+		if err != nil {
+			date = time.Now() // Use current time as fallback
+		}
+
 		commits = append(commits, models.CommitInfo{
-			Hash:    c.Hash.String(),
-			Message: c.Message,
-			Date:    c.Author.When,
+			Hash:    hash,
+			Message: fullMessage,
+			Date:    date,
 		})
-
-		return nil
-	})
-
-	// This error is expected when we reach the limit
-	if err != nil && !strings.Contains(err.Error(), "reached maximum commit limit") {
-		return nil, fmt.Errorf("error iterating commits: %w", err)
 	}
 
-	return commits, nil
+	return commits
+}
+
+// parseCommitDate attempts to parse a commit date string with multiple formats
+func (g *GitOperations) parseCommitDate(dateStr string) (time.Time, error) {
+	// Try RFC3339 format first (git's default with %aI)
+	if date, err := time.Parse(time.RFC3339, dateStr); err == nil {
+		return date, nil
+	}
+
+	// Try alternative formats
+	alternativeFormats := []string{
+		"2006-01-02 15:04:05 -0700",
+		"Mon Jan 2 15:04:05 2006 -0700",
+		time.RFC1123Z,
+	}
+
+	for _, format := range alternativeFormats {
+		if date, err := time.Parse(format, dateStr); err == nil {
+			return date, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("could not parse date: %s", dateStr)
 }
