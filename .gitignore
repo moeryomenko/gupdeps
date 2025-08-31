@@ -1,0 +1,10 @@
+# dev tools
+.idea
+.vscode
+
+# go artifacts
+bin
+
+# general artifacts
+*.out
+coverage.html

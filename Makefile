@@ -1,4 +1,8 @@
 COVER_FILE ?= coverage.out
+BINARIES_DIR ?= cmd
+BUILD_DIR ?= bin
+IMPORT_PATH ?= $(shell go list -m -f {{.Path}} | head -1)
+RACE_DETECTOR := $(if $(RACE_DETECTOR), -race)
 
 .PHONY: default
 default: help
@@ -25,6 +29,10 @@ cover: $(COVER_FILE) ## Output coverage in human readable form in html
 mod: ## Manage go mod dependencies, beautify go.mod and go.sum files.
 	@go tool go-mod-upgrade
 	@go mod tidy
+
+.PHONY: build
+build: ## Build the binary
+	go build $(RACE_DETECTOR) -o $(BUILD_DIR)/gupdeps $(IMPORT_PATH)/$(BINARIES_DIR)/gupdeps
 
 .PHONY: help
 help: ## Prints this help message
